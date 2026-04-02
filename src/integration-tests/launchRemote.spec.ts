@@ -23,6 +23,7 @@ import {
 } from './utils';
 import { expect } from 'chai';
 import * as os from 'os';
+import { DebugProtocol } from '@vscode/debugprotocol';
 
 describe('launch remote', function () {
     let dc: CdtDebugClient;
@@ -189,6 +190,10 @@ describe('launch remote', function () {
             } as TargetLaunchArguments,
         } as TargetLaunchRequestArguments;
 
+        const disconnect_args = {
+            terminateDebuggee: false,
+        } as DebugProtocol.DisconnectArguments;
+
         if (gdbAsync) {
             // Arguments which require gdbAsync support
             Object.assign(args, { customResetCommands: ['help'] });
@@ -198,7 +203,7 @@ describe('launch remote', function () {
         await dc.launchRequest(fillDefaults(this.test, args));
 
         // Disconnect
-        await dc.disconnectRequest();
+        await dc.disconnectRequest(disconnect_args);
 
         // Capture output events, spyOn doesn't work well with logger
         const stdOutput: string[] = [];

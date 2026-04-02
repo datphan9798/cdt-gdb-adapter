@@ -856,10 +856,14 @@ export class GDBTargetDebugSession extends GDBDebugSession {
                 ) {
                     // Need to pause first, then disconnect and exit.
                     await this.pauseIfNeeded(true);
-                    if (this.auxGdb?.isActive()) {
-                        await this.auxGdb.sendCommand('disconnect');
+                    let command = 'detach';
+                    if (sendTerminate) {
+                        command = 'disconnect';
                     }
-                    await this.gdb.sendCommand('disconnect');
+                    if (this.auxGdb?.isActive()) {
+                        await this.auxGdb.sendCommand(command);
+                    }
+                    await this.gdb.sendCommand(command);
                 }
 
                 if (this.auxGdb?.isActive()) {
@@ -908,7 +912,10 @@ export class GDBTargetDebugSession extends GDBDebugSession {
         _args: DebugProtocol.DisconnectArguments
     ): Promise<void> {
         try {
-            await this.doDisconnectRequest(0);
+            await this.doDisconnectRequest(
+                0,
+                _args?.terminateDebuggee ? true : false
+            );
             if (this.sessionInfo.disconnectError) {
                 this.sendErrorResponse(
                     response,
