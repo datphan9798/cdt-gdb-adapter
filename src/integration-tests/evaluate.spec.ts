@@ -299,15 +299,18 @@ describe('evaluate request', function () {
         expect(monitorVariable?.value).to.equal('10');
     });
 
-    it('should send invalidate event when changing global radix through evaluate request', async function () {
+    it('should send a custom event and an invalidate event when changing global radix through evaluate request', async function () {
         const event = dc.waitForEvent('invalidated');
+        const customEvent = dc.waitForEvent('OutputRadixUpdated');
         await dc.evaluateRequest({
             context: 'repl',
             expression: '> set output-radix 16',
             frameId: scope.frame.id,
         });
         const invalidatedEvent = await event;
+        const outputRadixUpdatedEvent = await customEvent;
         expect(invalidatedEvent).to.be.not.undefined;
+        expect(outputRadixUpdatedEvent.body.radix).eq('16');
     });
 });
 

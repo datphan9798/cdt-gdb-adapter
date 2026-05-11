@@ -23,6 +23,7 @@ import {
     Source,
     StackFrame,
     TerminatedEvent,
+    Event,
 } from '@vscode/debugadapter';
 import { DebugProtocol } from '@vscode/debugprotocol';
 import { ContinuedEvent } from '../events/continuedEvent';
@@ -3072,6 +3073,11 @@ export abstract class GDBDebugSessionBase extends LoggingDebugSession {
     private handleCmdParamChanged(notifyData: CmdParamChangedNotifyData) {
         switch (notifyData.param) {
             case 'output-radix':
+                this.sendEvent(
+                    new Event('OutputRadixUpdated', {
+                        radix: notifyData.value,
+                    })
+                );
                 this.sendEvent(new InvalidatedEvent(['variables']));
                 break;
             default:
