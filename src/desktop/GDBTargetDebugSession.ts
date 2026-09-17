@@ -20,6 +20,7 @@ import {
     TargetLaunchRequestArguments,
     TargetAttachRequestArguments,
     UARTArguments,
+    SymbolProvider,
 } from '../types/session';
 import {
     IGDBBackend,
@@ -32,6 +33,9 @@ import { GDBBackendFactory } from './factories/GDBBackendFactory';
 import { GDBServerFactory } from './factories/GDBServerFactory';
 import { isProcessActive } from '../util/processes';
 import { GDBCommandCancelled } from '../gdb/errors';
+import { AggregatingSymbolFileSource } from '../gdb/AggregatingSymbolFileSource';
+import { GNUObjdumpSymbolReader } from './GNUObjdumpSymbolReader';
+import { GlobalSymbolProvider } from '../gdb/GlobalSymbolProvider';
 
 // State of the Remote Target Debug Session
 enum SessionState {
@@ -266,6 +270,7 @@ export class GDBTargetDebugSession extends GDBDebugSession {
         this.initializeSessionArguments(args);
         this.showGlobalVariables =
             args.showGlobalVariables ?? this.showGlobalVariables;
+        this.globalSymbolsProvider = this.createGlobalSymbolsProvider(args);
 
         if (request === 'launch') {
             const launchArgs = args as TargetLaunchRequestArguments;
@@ -615,6 +620,7 @@ export class GDBTargetDebugSession extends GDBDebugSession {
             await this.executeOrAbort(gdb.sendFileExecAndSymbols.bind(gdb))(
                 args.program
             );
+            this.notifySymbolFileLoaded(args.program);
         }
         await this.executeOrAbort(gdb.sendEnablePrettyPrint.bind(gdb))();
 
@@ -630,6 +636,9 @@ export class GDBTargetDebugSession extends GDBDebugSession {
                         args.imageAndSymbols.symbolFileName
                     );
                 }
+                this.notifySymbolFileLoaded(
+                    args.imageAndSymbols.symbolFileName
+                );
             }
         }
     }
@@ -965,5 +974,18 @@ export class GDBTargetDebugSession extends GDBDebugSession {
         args: DebugProtocol.EvaluateArguments
     ): Promise<void> {
         return this.doEvaluateRequest(response, args, true);
+    }
+
+    protected createGlobalSymbolsProvider(
+        args: TargetAttachRequestArguments | TargetLaunchRequestArguments
+    ): SymbolProvider | undefined {
+        if (args.showGlobalVariables && args.objdumpPath) {
+            return new GlobalSymbolProvider(
+                new AggregatingSymbolFileSource(
+                    new GNUObjdumpSymbolReader(args.objdumpPath)
+                )
+            );
+        }
+        return super.createGlobalSymbolsProvider(args);
     }
 }
