@@ -44,6 +44,8 @@ import {
     CDTDisassembleArguments,
     RequestArgRun,
     GlobalVariableReference,
+    SymbolProvider,
+    GlobalSourceFileObjectReference,
 } from '../types/session';
 import { IGDBBackend, IGDBBackendFactory } from '../types/gdb';
 import { getInstructions } from '../util/disassembly';
@@ -55,6 +57,8 @@ import { ThreadWithStatus } from './common';
 import { RESUME_COMMANDS, SET_ALL_CHARSET_REGEXPS } from '../constants/gdb';
 import { GDBThreadRunning } from './errors';
 import { MIGDBDataEvaluateExpressionResponse } from '../mi';
+import { GlobalSymbolProvider } from './GlobalSymbolProvider';
+import { GDBSymbolInfoVariablesSource } from './GDBSymbolInfoVariablesSource';
 
 /**
  * Keeps track of where in the configuration phase (between initialized event
@@ -86,6 +90,8 @@ const cNumberTypeRegex = /\b(?:char|short|int|long|float|double)$/; // match C n
 const cBoolRegex = /\bbool$/; // match boolean
 const threadIdRegex = /.*\s+\-\-thread\s+(\d+).*/;
 const threadAllRegex = /.*\s+\-\-all(\s+.*|$)/;
+
+const GLOBAL_DEPTH = 0;
 
 // Interface for output category pair
 interface StreamOutput {
@@ -217,8 +223,12 @@ export abstract class GDBDebugSessionBase extends LoggingDebugSession {
     protected isInitialized = false; // unused here but kept for compatibility
     protected deferredStopEvents: any[] = [];
     protected firstContinueIsRun = false;
-    private readonly globalAddrCache = new Map<string, string>();
-    private globalSymbolNames: string[] = [];
+
+    protected globalSymbolAddressCache = new Map<
+        number,
+        Map<string, Map<string, string>>
+    >();
+    protected globalSymbolsProvider?: SymbolProvider;
     protected showGlobalVariables = false;
 
     /**
@@ -544,10 +554,11 @@ export abstract class GDBDebugSessionBase extends LoggingDebugSession {
         this.validateRequestArguments(args);
         await this.setupCommonLoggerAndBackends(args);
         this.initializeSessionArguments(args);
-
-        await this.spawn(args);
         this.showGlobalVariables =
             args.showGlobalVariables ?? this.showGlobalVariables;
+        this.globalSymbolsProvider = this.createGlobalSymbolsProvider(args);
+
+        await this.spawn(args);
         if (request == 'launch') {
             if (!args.program) {
                 this.sendErrorResponse(
@@ -560,6 +571,7 @@ export abstract class GDBDebugSessionBase extends LoggingDebugSession {
         }
         if (args.program) {
             await this.gdb.sendFileExecAndSymbols(args.program);
+            this.notifySymbolFileLoaded(args.program, true);
         }
         await this.gdb.sendEnablePrettyPrint();
 
@@ -2200,11 +2212,6 @@ export abstract class GDBDebugSessionBase extends LoggingDebugSession {
             frameHandle: args.frameId,
         };
 
-        const globalVarRef: GlobalVariableReference = {
-            type: 'global',
-            frameHandle: args.frameId,
-        };
-
         response.body = {
             scopes: [
                 new Scope(
@@ -2220,15 +2227,34 @@ export abstract class GDBDebugSessionBase extends LoggingDebugSession {
             ],
         };
 
-        if (this.showGlobalVariables) {
-            const globalNames = await this.getGlobalSymbolNames();
-            const globalScope: DebugProtocol.Scope = new Scope(
-                'Global',
-                this.variableHandles.create(globalVarRef),
-                true
-            );
-            globalScope.indexedVariables = globalNames.length;
-            response.body.scopes.splice(1, 0, globalScope);
+        if (this.globalSymbolsProvider) {
+            const frame = this.frameHandles.get(args.frameId);
+            if (frame) {
+                const inferiorId = await this.gdb.queryInferiorId(
+                    frame.threadId
+                );
+                if (inferiorId !== -1) {
+                    const globalVarRef: GlobalVariableReference = {
+                        type: 'global',
+                        frameHandle: args.frameId,
+                        inferiorId: inferiorId,
+                    };
+                    const globalScope: DebugProtocol.Scope = new Scope(
+                        'Global',
+                        this.variableHandles.create(globalVarRef),
+                        true
+                    );
+                    response.body.scopes.splice(1, 0, globalScope);
+                } else {
+                    logger.verbose(
+                        'Could not determine the current inferior. Global scope will not be provided.'
+                    );
+                }
+            } else {
+                logger.verbose(
+                    'Could not determine the current frame. Global scope will not be provided.'
+                );
+            }
         }
 
         this.sendResponse(response);
@@ -2271,13 +2297,10 @@ export abstract class GDBDebugSessionBase extends LoggingDebugSession {
                     await this.handleVariableRequestObject(ref);
             } else if (ref.type === 'global') {
                 response.body.variables =
-                    await this.handleVariableRequestGlobal(
-                        ref,
-                        args.start ?? 0,
-                        args.count && args.count > 0
-                            ? args.count
-                            : this.globalSymbolNames.length
-                    );
+                    await this.handleVariableRequestGlobalScope(ref);
+            } else if (ref.type === 'global_source_file_object') {
+                response.body.variables =
+                    await this.handleVariableRequestGlobal(ref);
             }
             this.sendResponse(response);
         } catch (err) {
@@ -2327,9 +2350,14 @@ export abstract class GDBDebugSessionBase extends LoggingDebugSession {
                 maxDepth: 100,
                 threadId: frameRef.threadId,
             });
-            const depth = parseInt(stackDepth.depth, 10);
+            let depth = parseInt(stackDepth.depth, 10);
+            let varManagerRef = frameRef;
+            if (ref.type === 'global_source_file_object') {
+                varManagerRef = this.getGlobalFrameRef(ref.inferiorId);
+                depth = GLOBAL_DEPTH;
+            }
             let varobj = this.gdb.varManager.getVar(
-                frameRef,
+                varManagerRef,
                 depth,
                 varname,
                 ref.type
@@ -2739,11 +2767,23 @@ export abstract class GDBDebugSessionBase extends LoggingDebugSession {
                     // Avoid sending the command to GDB
                     return;
                 }
-                return await this.evaluateRequestGdbCommand(
+                const addSymbolFileMatch = expressionNoPrefix.match(
+                    /^\s*add-symbol-file\s+(?:"([^"]+)"|'([^']+)'|(\S+))/i
+                );
+
+                await this.evaluateRequestGdbCommand(
                     response,
                     expressionNoPrefix,
                     initialFrameRef
                 );
+                if (addSymbolFileMatch && response.success !== false) {
+                    const symbolFilePath =
+                        addSymbolFileMatch[1] ??
+                        addSymbolFileMatch[2] ??
+                        addSymbolFileMatch[3];
+                    await this.notifySymbolFileLoaded(symbolFilePath);
+                }
+                return;
             }
 
             const [gdb, frameRef, depth] =
@@ -3896,87 +3936,124 @@ export abstract class GDBDebugSessionBase extends LoggingDebugSession {
         return Promise.resolve(variables);
     }
 
-    private async runInBatches<T, R>(
-        items: readonly T[],
-        batchSize: number,
-        func: (item: T, index: number) => Promise<R>
-    ): Promise<R[]> {
-        const results: R[] = new Array(items.length);
-        for (let i = 0; i < items.length; i += batchSize) {
-            const slice = items.slice(i, i + batchSize);
-            const responses = await Promise.all(
-                slice.map((item, k) => func(item, i + k))
-            );
-            for (let k = 0; k < responses.length; k++) {
-                results[i + k] = responses[k];
-            }
+    protected async handleVariableRequestGlobalScope(
+        ref: GlobalVariableReference
+    ): Promise<DebugProtocol.Variable[]> {
+        const variables: DebugProtocol.Variable[] = [];
+        if (this.globalSymbolsProvider === undefined) {
+            return variables;
         }
-        return results;
+        const frameRef = this.frameHandles.get(ref.frameHandle);
+        if (!frameRef) {
+            return variables;
+        }
+
+        const sourceFiles = await this.globalSymbolsProvider.getSourceFiles(
+            ref.inferiorId
+        );
+        for (const sourceFile of sourceFiles) {
+            const reference = this.variableHandles.create({
+                type: 'global_source_file_object',
+                frameHandle: ref.frameHandle,
+                inferiorId: ref.inferiorId,
+                sourceFile: sourceFile,
+            } satisfies GlobalSourceFileObjectReference);
+            variables.push({
+                name: sourceFile,
+                value: '',
+                variablesReference: reference,
+                presentationHint: { kind: 'virtual' },
+            });
+        }
+        return variables;
     }
 
     protected async handleVariableRequestGlobal(
-        ref: GlobalVariableReference,
-        start: number,
-        count: number
+        ref: GlobalSourceFileObjectReference
     ): Promise<DebugProtocol.Variable[]> {
-        const variables: Array<DebugProtocol.Variable | undefined> = [];
-        const GDB_BATCH_SIZE = 100;
-        const GLOBAL_FRAME_REFERENCE = { threadId: -1, frameId: -1 };
-        const GLOBAL_DEPTH = 0;
+        const variables: Array<DebugProtocol.Variable> = [];
         if (this.auxGdb && this.isRunning) {
             this.logger.verbose(
                 'Skipping variable frame request while target is running'
             );
-            return [];
+            return variables;
         }
-        const globalNames = await this.getGlobalSymbolNames();
-        const sliceNames = globalNames.slice(start, start + count);
-        const existingVarObjs: Array<{ varobj: VarObjType; index: number }> =
-            [];
-        const newNames: Array<{ name: string; index: number }> = [];
+        // frame handle to evaluate valid context
+        const frameRef = this.frameHandles.get(ref.frameHandle);
+        if (!frameRef) {
+            return variables;
+        }
+        if (!this.globalSymbolsProvider) {
+            return variables;
+        }
 
-        sliceNames.forEach((name, index) => {
+        const globalNames = await this.globalSymbolsProvider.getSymbolNames(
+            ref.inferiorId,
+            ref.sourceFile
+        );
+        if (!globalNames) {
+            return variables;
+        }
+        const existingVarObjs: Array<{
+            varobj: VarObjType;
+            index: number;
+        }> = [];
+
+        const newNames: Array<{
+            name: string;
+            index: number;
+        }> = [];
+
+        globalNames.forEach((name, index) => {
             const varobj = this.gdb.varManager.getVar(
-                GLOBAL_FRAME_REFERENCE,
+                this.getGlobalFrameRef(ref.inferiorId),
                 GLOBAL_DEPTH,
                 name
             );
             if (varobj) {
-                existingVarObjs.push({ varobj, index });
+                existingVarObjs.push({
+                    varobj,
+                    index,
+                });
             } else {
-                newNames.push({ name, index });
+                newNames.push({
+                    name,
+                    index,
+                });
             }
         });
 
+        // Update existing GDB variable objects.
         if (existingVarObjs.length > 0) {
-            const updateResults = await this.runInBatches(
-                existingVarObjs,
-                GDB_BATCH_SIZE,
-                ({ varobj, index }) =>
-                    mi
-                        .sendVarUpdate(this.gdb, { name: varobj.varname })
-                        .then((varUpdate) => ({
-                            varobj,
-                            index,
-                            update: varUpdate.changelist[0],
-                        }))
+            const updateResults = await Promise.all(
+                existingVarObjs.map(async ({ varobj, index }) => {
+                    const varUpdate = await mi.sendVarUpdate(this.gdb, {
+                        name: varobj.varname,
+                    });
+
+                    return {
+                        varobj,
+                        index,
+                        update: varUpdate.changelist[0],
+                    };
+                })
             );
+
             const varToDelete: string[] = [];
             const varToPush: Array<{
-                varobj: (typeof existingVarObjs)[number]['varobj'];
+                varobj: VarObjType;
                 index: number;
                 needAddr: boolean;
             }> = [];
+
             for (const { varobj, index, update } of updateResults) {
                 let pushVar = true;
                 if (update) {
-                    if (update.in_scope != 'true') {
+                    if (update.in_scope !== 'true') {
                         varToDelete.push(update.name);
                         pushVar = false;
-                    } else {
-                        if (update.name === varobj.varname) {
-                            varobj.value = update.value;
-                        }
+                    } else if (update.name === varobj.varname) {
+                        varobj.value = update.value;
                     }
                 }
                 if (pushVar) {
@@ -3987,14 +4064,21 @@ export abstract class GDBDebugSessionBase extends LoggingDebugSession {
                     });
                 }
             }
-            const varAddresses = await this.runInBatches(
-                varToPush,
-                GDB_BATCH_SIZE,
-                async ({ varobj, needAddr }) =>
-                    needAddr
-                        ? this.resolveGlobalAddr(varobj, this.gdb)
-                        : varobj.value
+
+            const varAddresses = await Promise.all(
+                varToPush.map(async ({ varobj, needAddr }) => {
+                    if (needAddr) {
+                        return this.resolveGlobalAddr(
+                            varobj,
+                            this.gdb,
+                            ref.inferiorId,
+                            ref.sourceFile
+                        );
+                    }
+                    return varobj.value;
+                })
             );
+
             for (let i = 0; i < varToPush.length; i++) {
                 const { varobj, index } = varToPush[i];
                 variables[index] = {
@@ -4013,45 +4097,101 @@ export abstract class GDBDebugSessionBase extends LoggingDebugSession {
                             : 0,
                 };
             }
-            await this.runInBatches(varToDelete, GDB_BATCH_SIZE, (varname) =>
-                this.gdb.varManager.removeVar(
-                    GLOBAL_FRAME_REFERENCE,
-                    GLOBAL_DEPTH,
-                    varname
+
+            // Remove variable objects that GDB reports as out of scope.
+            await Promise.all(
+                varToDelete.map((varname) =>
+                    this.gdb.varManager.removeVar(
+                        this.getGlobalFrameRef(ref.inferiorId),
+                        GLOBAL_DEPTH,
+                        varname
+                    )
                 )
             );
-            for (const varName of varToDelete) {
-                this.globalAddrCache.delete(varName);
+            const sourceFileMap = this.globalSymbolAddressCache.get(
+                ref.inferiorId
+            );
+            if (sourceFileMap) {
+                const symbolMap = sourceFileMap.get(ref.sourceFile);
+                if (symbolMap) {
+                    varToDelete.map((varname) => {
+                        symbolMap.delete(varname);
+                    });
+                    if (symbolMap.size === 0) {
+                        sourceFileMap.delete(ref.sourceFile);
+                    }
+                }
+                if (sourceFileMap.size === 0) {
+                    this.globalSymbolAddressCache.delete(ref.inferiorId);
+                }
             }
         }
 
+        /*
+         * Create GDB variable objects for global names that are not currently
+         * managed by varManager.
+         */
         if (newNames.length > 0) {
-            const newVarObjs = await this.runInBatches(
-                newNames,
-                GDB_BATCH_SIZE,
-                async ({ name, index }) => {
-                    const varCreateResponse = await mi.sendVarCreate(this.gdb, {
-                        expression: name,
-                    });
-                    const varobj = this.gdb.varManager.addVar(
-                        GLOBAL_FRAME_REFERENCE,
-                        GLOBAL_DEPTH,
-                        name,
-                        true,
-                        false,
-                        varCreateResponse
-                    );
-                    return { varobj, index };
-                }
+            const newVarsResult = await Promise.all(
+                newNames.map(async ({ name, index }) => {
+                    try {
+                        const varCreateResponse = await mi.sendVarCreate(
+                            this.gdb,
+                            {
+                                frame: 'floating',
+                                expression: this.getGlobalExpression(
+                                    ref.sourceFile,
+                                    name
+                                ),
+                                frameRef,
+                            }
+                        );
+
+                        const varobj = this.gdb.varManager.addVar(
+                            this.getGlobalFrameRef(ref.inferiorId),
+                            GLOBAL_DEPTH,
+                            name,
+                            true,
+                            false,
+                            varCreateResponse
+                        );
+
+                        return {
+                            varobj,
+                            index,
+                        };
+                    } catch (error) {
+                        this.logger.warn(
+                            `${error instanceof Error ? error.message : String(error)}`
+                        );
+                        return undefined;
+                    }
+                })
             );
-            const varAddresses = await this.runInBatches(
-                newVarObjs,
-                GDB_BATCH_SIZE,
-                async ({ varobj }) =>
-                    arrayRegex.test(varobj.type)
-                        ? await this.resolveGlobalAddr(varobj, this.gdb)
-                        : varobj.value
+
+            const newVarObjs = newVarsResult.filter(
+                (
+                    result
+                ): result is {
+                    varobj: VarObjType;
+                    index: number;
+                } => result !== undefined
             );
+
+            const varAddresses = await Promise.all(
+                newVarObjs.map(async ({ varobj }) => {
+                    if (arrayRegex.test(varobj.type)) {
+                        return this.resolveGlobalAddr(
+                            varobj,
+                            this.gdb,
+                            ref.inferiorId,
+                            ref.sourceFile
+                        );
+                    }
+                    return varobj.value;
+                })
+            );
+
             for (let i = 0; i < newVarObjs.length; i++) {
                 const { varobj, index } = newVarObjs[i];
                 variables[index] = {
@@ -4072,7 +4212,8 @@ export abstract class GDBDebugSessionBase extends LoggingDebugSession {
             }
         }
         return variables.filter(
-            (v): v is DebugProtocol.Variable => v !== undefined
+            (variable): variable is DebugProtocol.Variable =>
+                variable !== undefined
         );
     }
 
@@ -4164,7 +4305,7 @@ export abstract class GDBDebugSessionBase extends LoggingDebugSession {
             return addr.value ? addr.value : varobj.value;
         } catch (err) {
             // Some symbols are not real address at runtime
-            // e.g. optimized-out data, or tool-generated tables like Bison's `yystos`
+            // e.g. optimized-out data, or tool-generated tables
             this.logger.verbose(
                 `getAddr: failed to resolve address of '${varobj.expression}': ${
                     err instanceof Error ? err.message : String(err)
@@ -4174,26 +4315,101 @@ export abstract class GDBDebugSessionBase extends LoggingDebugSession {
         }
     }
 
-    private async resolveGlobalAddr(varobj: VarObjType, gdb: IGDBBackend) {
-        const cacheAddr = this.globalAddrCache.get(varobj.varname);
-        if (cacheAddr) {
-            return cacheAddr;
+    private async resolveGlobalAddr(
+        varobj: VarObjType,
+        gdb: IGDBBackend,
+        inferiorId: number,
+        sourceFile: string
+    ): Promise<string> {
+        let sourceFileMap = this.globalSymbolAddressCache.get(inferiorId);
+        if (!sourceFileMap) {
+            sourceFileMap = new Map<string, Map<string, string>>();
+            this.globalSymbolAddressCache.set(inferiorId, sourceFileMap);
         }
-        const addr = await this.getAddr(varobj, gdb);
-        this.globalAddrCache.set(varobj.varname, addr);
+        let symbolMap = sourceFileMap.get(sourceFile);
+        if (!symbolMap) {
+            symbolMap = new Map<string, string>();
+            sourceFileMap.set(sourceFile, symbolMap);
+        }
+        let addr = symbolMap.get(varobj.varname);
+        if (!addr) {
+            addr = await this.getGlobalAddr(varobj, gdb, sourceFile);
+            symbolMap.set(varobj.varname, addr);
+        }
         return addr;
     }
 
-    private async getGlobalSymbolNames(): Promise<string[]> {
-        if (this.globalSymbolNames.length === 0) {
-            const result = await mi.sendSymbolInfoVars(this.gdb);
-            const names: string[] = [];
-            for (const debug of result.symbols.debug) {
-                for (const variable of debug.symbols) names.push(variable.name);
-            }
-            this.globalSymbolNames = names;
+    protected createGlobalSymbolsProvider(
+        args: LaunchRequestArguments | AttachRequestArguments
+    ): SymbolProvider | undefined {
+        if (!args.showGlobalVariables) {
+            return undefined;
         }
-        return this.globalSymbolNames;
+        if (args.objdumpPath) {
+            this.logger.warn(
+                'objdumpPath is not supported for this debug session.\n Global variables will be provided by GDB'
+            );
+        }
+        return new GlobalSymbolProvider(
+            new GDBSymbolInfoVariablesSource(this.gdb)
+        );
+    }
+
+    protected async notifySymbolFileLoaded(
+        filePath: string,
+        resetSymbol: boolean = false
+    ): Promise<void> {
+        try {
+            const inferiorId = await this.gdb.queryInferiorId();
+            if (this.globalSymbolsProvider && inferiorId !== -1) {
+                if (resetSymbol) {
+                    this.globalSymbolsProvider.clear(inferiorId);
+                    this.globalSymbolAddressCache.delete(inferiorId);
+                }
+                this.globalSymbolsProvider.notifySymbolFileLoaded(
+                    inferiorId,
+                    filePath
+                );
+            }
+        } catch (error) {
+            this.logger.warn(
+                `Failed to index global symbols from "${filePath}": ${error instanceof Error ? error.message : String(error)}`
+            );
+        }
+    }
+
+    private getGlobalFrameRef(inferiorId: number): FrameReference {
+        // Synthesize a frame reference for global-variable varobjs that are not
+        // tied to any real stack frame. The thread ID is offset into negative
+        // space (-1000 - inferiorId) so it can never collide with a real GDB
+        // thread ID, while still uniquely identifying the inferior that owns
+        // these globals.
+        return { threadId: -1000 - inferiorId, frameId: -1 };
+    }
+
+    private getGlobalExpression(sourceFile: string, name: string): string {
+        const baseName = path.basename(sourceFile);
+        const escapedFile = baseName.replace(/'/g, "\\'");
+        return `'${escapedFile}'::${name}`;
+    }
+
+    private async getGlobalAddr(
+        varobj: VarObjType,
+        gdb: IGDBBackend,
+        sourceFile: string
+    ): Promise<string> {
+        try {
+            const addr = await mi.sendDataEvaluateExpression(
+                gdb,
+                `&(${this.getGlobalExpression(sourceFile, varobj.expression)})`
+            );
+            return addr.value ? addr.value : varobj.value;
+        } catch (err) {
+            this.logger.verbose(
+                `Failed to resolve address of '${varobj.expression}': ${err instanceof Error ? err.message : String(err)}`
+            );
+            return varobj.value;
+        }
     }
 
     protected isChildOfClass(child: mi.MIVarChild): boolean {
